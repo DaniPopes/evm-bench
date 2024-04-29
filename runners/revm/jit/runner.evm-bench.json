@@ -1,0 +1,5 @@
+{
+  "$schema": "../../schema.json",
+  "name": "revm-jit",
+  "entry": "entry.sh"
+}

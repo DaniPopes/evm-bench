@@ -2,18 +2,23 @@ use clap::Parser;
 use revm::{
     interpreter::{
         opcode::make_instruction_table,
-        primitives::{address, hex, Bytes, Env, LatestSpec, TransactTo},
+        primitives::{address, hex, Bytes, Env, TransactTo},
         Contract, DummyHost, Interpreter, SharedMemory,
     },
-    primitives::{ExecutionResult, Output, ResultAndState},
+    primitives::{CancunSpec, ExecutionResult, Output, ResultAndState, SpecId},
     Evm,
 };
+use revm_jit::llvm::{with_llvm_context, Context};
 use std::{fs, path::PathBuf, time::Instant};
 
 /// Revolutionary EVM (revm) runner interface
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Whether to use JIT
+    #[arg(long)]
+    jit: bool,
+
     /// Path to the hex contract code to deploy and run
     #[arg(long)]
     contract_code_path: PathBuf,
@@ -28,6 +33,10 @@ struct Args {
 }
 
 fn main() {
+    with_llvm_context(main_);
+}
+
+fn main_(cx: &Context) {
     let args = Args::parse();
 
     let creation_code_hex =
@@ -64,16 +73,30 @@ fn main() {
     run_env.tx.transact_to = TransactTo::call(created_address);
     run_env.tx.data = calldata;
 
-    let contract =
-        Contract::new_env(&run_env, created_bytecode.clone(), created_bytecode.hash_slow());
+    let contract = Contract::new_env(&run_env, created_bytecode.clone(), None);
     let mut host = DummyHost::new(run_env);
-    let table = &make_instruction_table::<_, LatestSpec>();
+    let table = &make_instruction_table::<_, CancunSpec>();
+
+    let mut compiler;
+    let jit_function = if args.jit {
+        let opt_level = revm_jit::OptimizationLevel::Aggressive;
+        let backend = revm_jit::new_llvm_backend(cx, false, opt_level).unwrap();
+        compiler = revm_jit::EvmCompiler::new(backend);
+        let bytecode = created_bytecode.original_byte_slice();
+        Some(compiler.jit(None, bytecode, SpecId::CANCUN).unwrap())
+    } else {
+        None
+    };
 
     for _ in 0..args.num_runs {
         let mut interpreter = Interpreter::new(contract.clone(), u64::MAX, false);
 
         let timer = Instant::now();
-        let action = interpreter.run(SharedMemory::new(), table, &mut host);
+        let action = if let Some(f) = jit_function {
+            unsafe { f.call_with_interpreter(&mut interpreter, &mut host) }
+        } else {
+            interpreter.run(SharedMemory::new(), table, &mut host)
+        };
         let dur = timer.elapsed();
 
         assert!(
